@@ -2093,7 +2093,7 @@ famfs_dax_shadow_logplay(
 	rc = famfs_dummy_mount(realdaxdev,
 			       0 /* figure out log size */,
 			       &mpt_out,
-			       0, verbose);
+			       NULL, 0, verbose);
 	if (rc) {
                 fprintf(stderr, "%s: Dummy mount failed\n", __func__);
 		rc = -1;
@@ -3102,7 +3102,7 @@ famfs_fsck(
 			 */
 			rc = famfs_dummy_mount(path,
 					       0 /* figure out log size */,
-					       &dummy_mpt, 0, verbose);
+					       &dummy_mpt, NULL, 0, verbose);
 			if (rc) {
 				fprintf(stderr,
 					"%s: dummy mount failed for %s\n",
@@ -5559,7 +5559,7 @@ famfs_mkfs_via_dummy_mount(
 	if (rc)
 		return rc;
 
-	rc = famfs_dummy_mount(daxdev, log_len, &mpt_out, 0, 0);
+	rc = famfs_dummy_mount(daxdev, log_len, &mpt_out, NULL, 0, 0);
 	if (rc) {
 		fprintf(stderr, "%s: dummy mount failed for %s\n",
 			__func__, daxdev);

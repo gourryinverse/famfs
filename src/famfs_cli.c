@@ -261,6 +261,7 @@ do_famfs_cli_mount(int argc, char *argv[])
 	int useraccess = 1;
 	int default_perm = 1;
 	char *shadowpath = NULL;
+	char *bpffs = NULL;
 	int use_mmap = 0;
 	char *mpt = NULL;
 	int remaining_args;
@@ -285,6 +286,7 @@ do_famfs_cli_mount(int argc, char *argv[])
 		{"nouseraccess", no_argument,          0,  'u'},
 		{"nodefaultperm", no_argument,         0,  'p'},
 		{"shadow",     required_argument,      0,  'S'},
+		{"bpffs",      required_argument,      0,  'B'},
 		{"dummy",      no_argument,            0,  'D'},
 
 		/* un-advertised options */
@@ -300,7 +302,7 @@ do_famfs_cli_mount(int argc, char *argv[])
 	 * to return -1 when it sees something that is not recognized option
 	 * (e.g. the command that will mux us off to the command handlers
 	 */
-	while ((c = getopt_long(argc, argv, "+h?RrfFmvupbdt:c:S:D",
+	while ((c = getopt_long(argc, argv, "+h?RrfFmvupbdt:c:S:B:D",
 				mount_options, &optind)) != EOF) {
 
 		switch (c) {
@@ -358,6 +360,9 @@ do_famfs_cli_mount(int argc, char *argv[])
 			break;
 		case 'D':
 			dummy = 1;
+			break;
+		case 'B':
+			bpffs = optarg;
 			break;
 		}
 	}
@@ -450,6 +455,7 @@ do_famfs_cli_mount(int argc, char *argv[])
 			rc = famfs_dummy_mount(realdaxdev,
 					       0 /* figure out log size */,
 					       &mpt_out,
+					       bpffs,
 					       debug, verbose);
 			if (rc == 0)
 				printf("Successful dummy mount at %s\n",
@@ -461,6 +467,7 @@ do_famfs_cli_mount(int argc, char *argv[])
 
 		printf("daxdev=%s, mpt=%s\n", realdaxdev, realmpt);
 		rc = famfs_mount_fuse(realdaxdev, realmpt, shadowpath,
+				      bpffs,
 				      timeout, use_mmap, useraccess,
 				      default_perm,
 				      0, 0, /* not dummy mount */

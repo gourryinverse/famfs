@@ -506,6 +506,7 @@ famfs_start_fuse_daemon(
 	const char *mpt,
 	const char *daxdev,
 	const char *shadow,
+	const char *bpffs,
 	ssize_t timeout,
 	int useraccess,
 	int default_perm,
@@ -577,6 +578,13 @@ famfs_start_fuse_daemon(
 	if (default_perm) {
 		char useraccess_arg[PATH_MAX] = ",default_permissions";
 		strncat(opts, useraccess_arg,
+			sizeof(opts) - strlen(opts) - 1);
+	}
+
+	if (bpffs) {
+		char bpffs_arg[PATH_MAX];
+		snprintf(bpffs_arg, sizeof(bpffs_arg), ",bpffs=%s", bpffs);
+		strncat(opts, bpffs_arg,
 			sizeof(opts) - strlen(opts) - 1);
 	}
 
@@ -690,6 +698,7 @@ famfs_mount_fuse(
 	const char *realdaxdev,
 	const char *realmpt,
 	const char *realshadow,
+	const char *bpffs,
 	ssize_t timeout,
 	int logplay_use_mmap,
 	int useraccess,
@@ -794,7 +803,8 @@ famfs_mount_fuse(
 	}
 
 	/* Start the fuse daemon, which mounts the FS */
-	rc = famfs_start_fuse_daemon(realmpt, realdaxdev, local_shadow, timeout,
+	rc = famfs_start_fuse_daemon(realmpt, realdaxdev, local_shadow, bpffs,
+				     timeout,
 				     useraccess, default_perm, debug, verbose);
 	if (rc < 0) {
 		fprintf(stderr, "%s: failed to start fuse daemon\n", __func__);
@@ -954,6 +964,7 @@ famfs_dummy_mount(
 	const char *realdaxdev,
 	size_t log_size,
 	char **mpt_out,
+	const char *bpffs,
 	int debug,
 	int verbose)
 {
@@ -975,7 +986,7 @@ famfs_dummy_mount(
 	}
 
 	assert(mpt_out);
-	rc = famfs_mount_fuse(realdaxdev, mpt, NULL, 100, 0,
+	rc = famfs_mount_fuse(realdaxdev, mpt, NULL, bpffs, 100, 0,
 			      1 /* useraccess */,
 			      1 /* default_perm */,
 			      1 /* dummy */,

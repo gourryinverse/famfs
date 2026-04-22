@@ -21,6 +21,9 @@ struct famfs_ctx {
 	int xattr;
 	char *source;
 	char *daxdev;
+	char *bpffs;		/* bpffs pin directory (e.g. /tmp/bpffs/fuse_dax) */
+	int meta_map_fd;	/* BPF hashmap fd for per-file metadata */
+	int dev_map_fd;		/* BPF hashmap fd for device info */
 	int max_daxdevs;
 	struct famfs_daxdev *daxdev_table;
 	double timeout;

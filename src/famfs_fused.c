@@ -32,6 +32,8 @@
 
 #include "famfs_lib.h"
 #include "famfs_fmap.h"
+#include "famfs_bpf_map.h"
+#include "famfs_bpf_common.h"
 #include "fuse_kernel.h"
 #include "fuse_i.h"
 #include "famfs_fused.h"
@@ -136,6 +138,8 @@ static const struct fuse_opt famfs_opts[] = {
 	  offsetof(struct famfs_ctx, source), 0 }, /* opts source & shadow are same */
 	{ "daxdev=%s",
 	  offsetof(struct famfs_ctx, daxdev), 0 },
+	{ "bpffs=%s",
+	  offsetof(struct famfs_ctx, bpffs), 0 },
 	{ "flock",
 	  offsetof(struct famfs_ctx, flock), 1 },
 	{ "no_flock",
@@ -226,7 +230,7 @@ static void famfs_init(
 			famfs_log(FAMFS_LOG_NOTICE,
 				 "%s: ENABLING DAX_IOMAP\n", __func__);
 			conn->want_ext |= FUSE_CAP_IOMAP;
-			strncpy(conn->dax_fmap_ops_name, "dax_simple_ops",
+			strncpy(conn->dax_fmap_ops_name, "dax_simple",
 				sizeof(conn->dax_fmap_ops_name) - 1);
 		} else {
 			famfs_log(FAMFS_LOG_NOTICE,
@@ -597,121 +601,6 @@ famfs_lookup(
 }
 
 static void
-famfs_get_fmap(
-	fuse_req_t req,
-	fuse_ino_t nodeid,
-	size_t size)
-{
-	struct famfs_ctx *lo = famfs_ctx_from_req(req);
-	ssize_t fmap_bufsize = FMAP_MSG_MAX;
-	struct famfs_inode *inode = NULL;
-	struct fuse_get_fmap_out *hdr;
-	char *fmap_message = NULL;
-	uint32_t meta_size = 0;
-	ssize_t fmap_size;
-	int err = 0;
-	(void)size;
-
-	fmap_message = calloc(1, fmap_bufsize);
-	if (!fmap_message) {
-		err = ENOMEM;
-		goto out_err;
-	}
-
-	inode = famfs_get_inode_from_nodeid(&lo->icache, nodeid);
-
-	if (!inode) {
-		famfs_log(FAMFS_LOG_ERR, "%s: inode 0x%ld not found\n",
-			 __func__, nodeid);
-		err = EINVAL;
-		goto out_err;
-	}
-
-	if (!inode->fmeta) {
-		famfs_log(FAMFS_LOG_ERR, "%s: no fmap on inode\n", __func__);
-		err = ENOENT;
-		goto out_err;
-	}
-
-	hdr = (struct fuse_get_fmap_out *)fmap_message;
-	fmap_size = famfs_log_file_meta_to_msg(
-			fmap_message + sizeof(*hdr),
-			fmap_bufsize - sizeof(*hdr),
-			0, inode->fmeta, &meta_size);
-	if (fmap_size <= 0) {
-		famfs_log(FAMFS_LOG_ERR,
-			  "%s: %ld error putting fmap in message\n",
-			 __func__, fmap_size);
-		err = EINVAL;
-		goto out_err;
-	}
-
-	hdr->meta_size = meta_size;
-	hdr->reserved = 0;
-	fmap_size += sizeof(*hdr);
-
-	err = fuse_reply_buf(req, fmap_message, fmap_size);
-	if (err)
-		famfs_log(FAMFS_LOG_ERR, "%s: fuse_reply_buf returned err %d\n",
-			 __func__, err);
-
-	free(fmap_message);
-
-	famfs_inode_putref(inode);
-	return;
-
-out_err:
-	if (inode)
-		famfs_inode_putref(inode);
-
-	if (fmap_message)
-		free(fmap_message);
-
-	fuse_reply_err(req, err);
-}
-
-static void
-famfs_get_daxdev(
-	fuse_req_t req,
-	uint32_t daxdev_index)
-{
-	struct famfs_ctx *fd = famfs_ctx_from_req(req);
-	struct fuse_get_daxdev_out daxdev;
-	int err = 0;
-
-	famfs_log(FAMFS_LOG_NOTICE, "%s: daxdev_index=%d\n",
-		 __func__, daxdev_index);
-	memset(&daxdev, 0, sizeof(daxdev));
-
-	/* Fill in daxdev struct */
-	if (daxdev_index != 0) {
-		/* XXX drop this test when we support more than one daxdev */
-		famfs_log(FAMFS_LOG_ERR, "%s: non-zero daxdev index\n",
-			  __func__);
-		err = EINVAL;
-		goto out_err;
-	}
-	if (!fd->daxdev) {
-		famfs_log(FAMFS_LOG_ERR, "%s: dax not enabled\n", __func__);
-		err = EOPNOTSUPP;
-		goto out_err;
-	}
-
-	strncpy(daxdev.name, fd->daxdev_table[daxdev_index].dd_daxdev,
-		FAMFS_DEVNAME_LEN - 1);
-
-	err = fuse_reply_buf(req, (void *)&daxdev, sizeof(daxdev));
-	if (err)
-		famfs_log(FAMFS_LOG_ERR,
-			  "%s: fuse_reply_buf returned err %d\n",
-			 __func__, err);
-	return;
-
-out_err:
-	fuse_reply_err(req, err);
-}
-
-static void
 famfs_forget_one(
 	fuse_req_t req,
 	fuse_ino_t nodeid,
@@ -983,6 +872,80 @@ famfs_create(
 	fuse_reply_err(req, ENOTSUP);
 }
 
+static int
+famfs_bpf_push_meta(struct famfs_ctx *lo, uint64_t nodeid,
+		    const struct famfs_log_file_meta *fmeta)
+{
+	struct famfs_file_meta meta;
+	const struct famfs_log_fmap *fmap = &fmeta->fm_fmap;
+
+	if (lo->meta_map_fd < 0)
+		return 0;
+
+	memset(&meta, 0, sizeof(meta));
+	meta.file_size = fmeta->fm_size;
+
+	switch (fmap->fmap_ext_type) {
+	case FAMFS_EXT_SIMPLE:
+		meta.fm_extent_type = FUSE_FAMFS_EXT_SIMPLE;
+		meta.fm_nextents = fmap->fmap_nextents;
+		if (meta.fm_nextents > FAMFS_BPF_MAX_EXTENTS)
+			meta.fm_nextents = FAMFS_BPF_MAX_EXTENTS;
+		for (uint32_t i = 0; i < meta.fm_nextents; i++) {
+			meta.se[i].dev_index = fmap->se[i].se_devindex;
+			meta.se[i].ext_offset = fmap->se[i].se_offset;
+			meta.se[i].ext_len = fmap->se[i].se_len;
+			meta.dev_bitmap |= (1ULL << fmap->se[i].se_devindex);
+		}
+		break;
+
+	case FAMFS_EXT_INTERLEAVE:
+		meta.fm_extent_type = FUSE_FAMFS_EXT_INTERLEAVE;
+		meta.fm_niext = fmap->fmap_niext;
+		if (meta.fm_niext > FAMFS_BPF_MAX_EXTENTS)
+			meta.fm_niext = FAMFS_BPF_MAX_EXTENTS;
+		for (uint32_t i = 0; i < meta.fm_niext; i++) {
+			struct famfs_meta_interleaved_ext_bpf *dst = &meta.ie[i];
+			const struct famfs_interleaved_ext *src = &fmap->ie[i];
+
+			dst->fie_nstrips = src->ie_nstrips;
+			dst->fie_chunk_size = src->ie_chunk_size;
+			dst->fie_nbytes = fmeta->fm_size;
+			if (dst->fie_nstrips > FAMFS_BPF_MAX_STRIPS)
+				dst->fie_nstrips = FAMFS_BPF_MAX_STRIPS;
+			for (uint64_t j = 0; j < dst->fie_nstrips; j++) {
+				dst->ie_strips[j].dev_index =
+					src->ie_strips[j].se_devindex;
+				dst->ie_strips[j].ext_offset =
+					src->ie_strips[j].se_offset;
+				dst->ie_strips[j].ext_len =
+					src->ie_strips[j].se_len;
+				meta.dev_bitmap |=
+					(1ULL << src->ie_strips[j].se_devindex);
+			}
+		}
+		break;
+
+	default:
+		famfs_log(FAMFS_LOG_ERR,
+			  "%s: unknown ext type %d\n",
+			  __func__, fmap->fmap_ext_type);
+		return -EINVAL;
+	}
+
+	if (bpf_map_update(lo->meta_map_fd, &nodeid, &meta, BPF_ANY) < 0) {
+		famfs_log(FAMFS_LOG_ERR,
+			  "%s: bpf_map_update failed: %s\n",
+			  __func__, strerror(errno));
+		return -errno;
+	}
+
+	famfs_log(FAMFS_LOG_DEBUG,
+		  "%s: pushed meta for nodeid 0x%lx\n",
+		  __func__, nodeid);
+	return 0;
+}
+
 static void
 famfs_open(
 	fuse_req_t req,
@@ -1013,6 +976,9 @@ famfs_open(
 	   To make parallel_direct_writes valid, need set fi->direct_io
 	   in current function. */
 	fi->parallel_direct_writes = 1;
+
+	if (inode->fmeta && lo->meta_map_fd >= 0)
+		famfs_bpf_push_meta(lo, nodeid, inode->fmeta);
 
 	/*
 	 * We got a ref on the inode above, and it will stay on the inode until
@@ -1209,8 +1175,6 @@ static const struct fuse_lowlevel_ops famfs_oper = {
 	/* .copy_file_range */
 #endif
 	/* .lseek */
-	.get_fmap       = famfs_get_fmap,
-	.get_daxdev     = famfs_get_daxdev,
 };
 
 void jg_print_fuse_opts(struct fuse_cmdline_opts *opts)
@@ -1329,6 +1293,57 @@ int main(int argc, char *argv[])
 			calloc(MAX_DAXDEVS, sizeof(*lo->daxdev_table));
 		strncpy(lo->daxdev_table[0].dd_daxdev,
 			lo->daxdev, FAMFS_DEVNAME_LEN - 1);
+	}
+
+	lo->meta_map_fd = -1;
+	lo->dev_map_fd = -1;
+	if (!lo->bpffs)
+		lo->bpffs = getenv("FAMFS_BPFFS") ? strdup(getenv("FAMFS_BPFFS")) : NULL;
+	if (lo->bpffs) {
+		char path[PATH_MAX];
+
+		snprintf(path, sizeof(path), "%s/famfs_meta_map", lo->bpffs);
+		lo->meta_map_fd = bpf_obj_get(path);
+		if (lo->meta_map_fd < 0)
+			famfs_log(FAMFS_LOG_ERR,
+				  "%s: failed to open BPF meta map at %s: %s\n",
+				  __func__, path, strerror(errno));
+		else
+			famfs_log(FAMFS_LOG_NOTICE,
+				  "%s: opened BPF meta map fd=%d\n",
+				  __func__, lo->meta_map_fd);
+
+		snprintf(path, sizeof(path), "%s/famfs_dev_map", lo->bpffs);
+		lo->dev_map_fd = bpf_obj_get(path);
+		if (lo->dev_map_fd < 0)
+			famfs_log(FAMFS_LOG_ERR,
+				  "%s: failed to open BPF dev map at %s: %s\n",
+				  __func__, path, strerror(errno));
+		else
+			famfs_log(FAMFS_LOG_NOTICE,
+				  "%s: opened BPF dev map fd=%d\n",
+				  __func__, lo->dev_map_fd);
+
+		if (lo->dev_map_fd >= 0 && lo->daxdev_table) {
+			struct famfs_dev_info {
+				char path[256];
+			} dev_info;
+			uint32_t dev_index = 0;
+
+			memset(&dev_info, 0, sizeof(dev_info));
+			strncpy(dev_info.path,
+				lo->daxdev_table[0].dd_daxdev,
+				sizeof(dev_info.path) - 1);
+			if (bpf_map_update(lo->dev_map_fd, &dev_index,
+					   &dev_info, BPF_ANY) < 0)
+				famfs_log(FAMFS_LOG_ERR,
+					  "%s: failed to push dev[0] to BPF map: %s\n",
+					  __func__, strerror(errno));
+			else
+				famfs_log(FAMFS_LOG_NOTICE,
+					  "%s: pushed dev[0]=%s to BPF map\n",
+					  __func__, dev_info.path);
+		}
 	}
 
 	if (!lo->source) {
